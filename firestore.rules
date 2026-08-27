@@ -1,0 +1,188 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==========================================
+    // HELPER FUNCTIONS & AUTHENTICATION CONTEXT
+    // ==========================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Role verification: Custom claims (Priority) OR verified server-controlled User Document
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'ADMIN' ||
+        request.auth.token.role == 'COACH' ||
+        request.auth.token.admin == true ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN' ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'COACH'
+      );
+    }
+
+    // Secure Student Ownership: Authenticated UID MUST map to studentId in users/{uid} or custom claim
+    function isStudentOwner(studentId) {
+      return isAuthenticated() && (
+        request.auth.token.studentId == studentId ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.studentId == studentId
+      );
+    }
+
+    // Strict Date Validation for Attendance: Must match server request date (UTC/IST bounds)
+    function isServerCurrentDate(dateStr) {
+      let y = string(request.time.year());
+      let m = request.time.month() < 10 ? '0' + string(request.time.month()) : string(request.time.month());
+      let d = request.time.day() < 10 ? '0' + string(request.time.day()) : string(request.time.day());
+      let serverToday = y + '-' + m + '-' + d;
+      return dateStr == serverToday;
+    }
+
+    // ==========================================
+    // 1. USERS COLLECTION (Account & Role Mapping)
+    // ==========================================
+    match /users/{userId} {
+      // User can read their own profile; Admin can read all
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+
+      // User can create their account doc on initial signup, but CANNOT self-assign 'ADMIN' or 'COACH' role
+      allow create: if isAuthenticated() && request.auth.uid == userId
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.role != 'ADMIN'
+                    && request.resource.data.role != 'COACH';
+
+      // User cannot elevate their own role upon update; only Admin can assign/modify roles
+      allow update: if isAdmin() || (
+        isAuthenticated() && request.auth.uid == userId
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.studentId == resource.data.studentId
+      );
+
+      // Deletion is strictly reserved for Admin
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 2. STUDENTS COLLECTION (Cadet Profiles)
+    // ==========================================
+    match /students/{studentId} {
+      // Cadet can only read their own profile; Admin can read all cadet profiles
+      allow read: if isStudentOwner(studentId) || isAdmin();
+
+      // Cadets cannot create/update student directory records directly; Admin manages enrollment
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 3. ATTENDANCE COLLECTION
+    // ==========================================
+    match /attendance_records/{recordId} {
+      // Cadet can read only their own attendance records
+      allow read: if isAuthenticated() && (isStudentOwner(resource.data.studentId) || isAdmin());
+
+      // Cadet can CREATE attendance ONLY for themselves and ONLY for the server-verified current date
+      allow create: if isAuthenticated() && (
+        (isStudentOwner(request.resource.data.studentId) && isServerCurrentDate(request.resource.data.date))
+        || isAdmin()
+      );
+
+      // Cadets CANNOT update or overwrite attendance once marked; Admin can correct
+      allow update: if isAdmin();
+
+      // Cadets cannot delete attendance records
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 4. TRAINING RECORDS (Physical Ground Metrics)
+    // ==========================================
+    match /training_records/{recordId} {
+      // Cadet can read only their own training records
+      allow read: if isAuthenticated() && (isStudentOwner(resource.data.studentId) || isAdmin());
+
+      // Cadets can log their daily physical workouts for their own profile
+      allow create: if isAuthenticated() && (isStudentOwner(request.resource.data.studentId) || isAdmin());
+
+      // Cadets cannot modify historical training logs once created; only Admin can correct
+      allow update: if isAdmin();
+
+      // Cadets cannot delete training logs
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 5. TEST ATTEMPTS (Exam & Mock Results)
+    // ==========================================
+    match /test_attempts/{attemptId} {
+      // Cadet can read only their own test attempt results
+      allow read: if isAuthenticated() && (isStudentOwner(resource.data.studentId) || isAdmin());
+
+      // Cadet can submit their completed attempt for their own studentId
+      allow create: if isAuthenticated() && (isStudentOwner(request.resource.data.studentId) || isAdmin());
+
+      // Submitted scores and attempt logs are IMMUTABLE for students; only Admin can correct
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 6. LEADERBOARD (Rankings & Competition)
+    // ==========================================
+    match /leaderboard/{rankId} {
+      // Public/Cadet read access for academy ranking visibility
+      allow read: if isAuthenticated();
+
+      // Students can NEVER write or alter leaderboard records
+      allow write: if isAdmin();
+    }
+
+    // ==========================================
+    // 7. QUESTIONS BANK (Exam MCQs)
+    // ==========================================
+    match /questions/{questionId} {
+      // Logged-in cadets can read question bank for practice tests
+      allow read: if isAuthenticated();
+
+      // Questions bank is strictly CMS/Admin managed
+      allow write: if isAdmin();
+    }
+
+    // ==========================================
+    // 8. MOCK TESTS CONFIGURATION
+    // ==========================================
+    match /mock_tests/{testId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // ==========================================
+    // 9. PUBLIC CONTENT (Notices, Syllabus & Recruitment)
+    // ==========================================
+    match /notices/{noticeId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /recruitment_info/{infoId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /study_subjects/{subjectId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /study_topics/{topicId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ==========================================
+    // 10. DEFAULT DENY (Catch-all Fallback)
+    // ==========================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
